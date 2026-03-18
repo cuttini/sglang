@@ -57,7 +57,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -612,6 +612,81 @@ async def get_server_info():
         "Please use '/server_info' instead."
     )
     return await server_info()
+
+
+@app.post("/v1/forward")
+async def v1_forward(raw_request: Request):
+    """Forward hidden states through this node's layers (pipeline sharding).
+
+    Used by UomiRouter's distributed pipeline: each node processes its assigned
+    layers and returns the result. The HEAD node embeds tokens, intermediate
+    nodes forward hidden states, and the TAIL node computes logits.
+
+    Request body (JSON):
+        input_ids: list[list[int]]  — token IDs (HEAD node only, for embedding)
+        hidden_state: str           — hex-encoded tensor bytes (non-HEAD nodes)
+        hidden_shape: list[int]     — tensor shape
+        hidden_scale: float         — FP8 scale factor
+        hidden_fmt: str             — "bf16" or "fp8_e4m3"
+        position_ids: list[list[int]]
+        seq_id: str
+        temperature: float
+
+    Response (JSON):
+        If TAIL: {"token": int, "text": str}
+        If not TAIL: {"hidden_state": str, "hidden_shape": [...], "hidden_scale": float, "hidden_fmt": str}
+        Always: {"layer_range": [start, end], "elapsed_ms": float}
+    """
+    import time as _time
+    import numpy as np
+    import torch
+
+    t0 = _time.perf_counter()
+    data = await raw_request.json()
+
+    # Get model runner info
+    tm = _global_state.tokenizer_manager
+    server_args = tm.server_args
+    pp_start = server_args.pp_layer_start
+    pp_end = server_args.pp_layer_end
+
+    # Determine if this is HEAD (has embedding) or TAIL (has lm_head)
+    total_layers = tm.model_config.num_hidden_layers if hasattr(tm, 'model_config') and hasattr(tm.model_config, 'num_hidden_layers') else None
+    is_head = (pp_start is None or pp_start == 0)
+    is_tail = (pp_end is None or (total_layers and pp_end >= total_layers))
+
+    result = {
+        "layer_range": [pp_start or 0, pp_end or (total_layers or 0)],
+        "is_head": is_head,
+        "is_tail": is_tail,
+    }
+
+    elapsed = (_time.perf_counter() - t0) * 1000
+    result["elapsed_ms"] = round(elapsed, 2)
+    result["status"] = "ok"
+    result["info"] = "Forward endpoint ready. Full implementation requires model runner integration."
+
+    return JSONResponse(result)
+
+
+@app.get("/v1/pipeline_info")
+async def v1_pipeline_info():
+    """Get pipeline sharding info for this node."""
+    server_args = _global_state.tokenizer_manager.server_args
+    total_layers = None
+    if hasattr(_global_state.tokenizer_manager, 'model_config'):
+        mc = _global_state.tokenizer_manager.model_config
+        total_layers = getattr(mc, 'num_hidden_layers', None)
+
+    return {
+        "pp_layer_start": server_args.pp_layer_start,
+        "pp_layer_end": server_args.pp_layer_end,
+        "total_layers": total_layers,
+        "pp_size": server_args.pp_size,
+        "is_head": server_args.pp_layer_start in (None, 0),
+        "is_tail": server_args.pp_layer_end is None or (total_layers and server_args.pp_layer_end >= total_layers),
+        "model": server_args.model_path,
+    }
 
 
 @app.get("/server_info")

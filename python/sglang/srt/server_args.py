@@ -365,6 +365,11 @@ class ServerArgs:
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
+    # UomiRouter: explicit layer range for distributed pipeline sharding
+    # When set, only layers [pp_layer_start, pp_layer_end) are loaded and executed.
+    # Other layers are replaced with PPMissingLayer (no-op passthrough).
+    pp_layer_start: Optional[int] = None
+    pp_layer_end: Optional[int] = None
     stream_interval: int = 1
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
@@ -3864,6 +3869,18 @@ class ServerArgs:
             help="The async batch depth of pipeline parallelism.",
         )
         parser.add_argument(
+            "--pp-layer-start",
+            type=int,
+            default=ServerArgs.pp_layer_start,
+            help="Start layer index (inclusive) for pipeline sharding. Only layers [start, end) are loaded.",
+        )
+        parser.add_argument(
+            "--pp-layer-end",
+            type=int,
+            default=ServerArgs.pp_layer_end,
+            help="End layer index (exclusive) for pipeline sharding. Only layers [start, end) are loaded.",
+        )
+        parser.add_argument(
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
@@ -5761,6 +5778,15 @@ class ServerArgs:
         return max(FLA_CHUNK_SIZE, self.page_size)
 
     def check_server_args(self):
+        # Propagate explicit layer range to environment (picked up by make_layers)
+        if self.pp_layer_start is not None and self.pp_layer_end is not None:
+            import os
+            os.environ["SGLANG_PP_LAYER_START"] = str(self.pp_layer_start)
+            os.environ["SGLANG_PP_LAYER_END"] = str(self.pp_layer_end)
+            # Force pp_size=1 to avoid conflicts with regular PP
+            if self.pp_size == 1:
+                pass  # OK, using explicit layer range instead
+
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size

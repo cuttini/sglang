@@ -633,22 +633,35 @@ def make_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
-    """Make a list of layers with the given layer function"""
+    """Make a list of layers with the given layer function.
+
+    Supports explicit layer range via SGLANG_PP_LAYER_START / SGLANG_PP_LAYER_END
+    env vars or server_args.pp_layer_start / pp_layer_end. When set, only layers
+    in [start, end) are loaded; others become PPMissingLayer no-ops.
+    """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
-    start_layer, end_layer = (
-        get_pp_indices(
+
+    # Check for explicit layer range (UomiRouter pipeline sharding)
+    import os
+    explicit_start = os.environ.get("SGLANG_PP_LAYER_START")
+    explicit_end = os.environ.get("SGLANG_PP_LAYER_END")
+
+    if explicit_start is not None and explicit_end is not None:
+        start_layer = int(explicit_start)
+        end_layer = min(int(explicit_end), num_hidden_layers)
+    elif pp_rank is not None and pp_size is not None:
+        start_layer, end_layer = get_pp_indices(
             num_hidden_layers,
             pp_rank,
             pp_size,
         )
-        if pp_rank is not None and pp_size is not None
-        else (0, num_hidden_layers)
-    )
+    else:
+        start_layer, end_layer = 0, num_hidden_layers
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
         + get_offloader().wrap_modules(
